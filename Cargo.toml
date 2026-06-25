@@ -1,0 +1,27 @@
+[package]
+name = "evbridge"
+version = "0.1.0"
+edition = "2024"
+description = "Bridge Linux evdev input devices into a Wayland compositor via wlroots virtual input — hotplug-aware, for headless/nested Wayland (game streaming, remote sessions)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/atassis/evbridge"
+readme = "README.md"
+authors = ["atassis <atassikay38@gmail.com>"]
+keywords = ["wayland", "evdev", "input", "virtual-input", "wlroots"]
+categories = ["command-line-utilities", "os::linux-apis"]
+publish = false
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+evdev = "0.13"
+inotify = "0.11"
+xkbcommon = "0.9"
+rustix = { version = "0.38", features = ["fs"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ctrlc = "3"
