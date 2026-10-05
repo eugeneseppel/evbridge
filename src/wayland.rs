@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use calloop::RegistrationToken;
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop,
     protocol::{wl_registry, wl_seat},
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
@@ -25,6 +25,7 @@ use crate::mouse::MouseFrame;
 /// Holds Wayland globals obtained from wl_registry.
 pub struct WaylandState {
     pub seat: Option<wl_seat::WlSeat>,
+    seats: Vec<(wl_seat::WlSeat, Option<String>)>,
     pub vptr_mgr: Option<ZwlrVirtualPointerManagerV1>,
     pub vkbd_mgr: Option<ZwpVirtualKeyboardManagerV1>,
 }
@@ -33,9 +34,48 @@ impl WaylandState {
     fn new() -> Self {
         Self {
             seat: None,
+            seats: Vec::new(),
             vptr_mgr: None,
             vkbd_mgr: None,
         }
+    }
+
+    fn select_seat(&mut self, requested_name: Option<&str>) -> Result<(), String> {
+        let selected = match requested_name {
+            Some(requested) => self
+                .seats
+                .iter()
+                .find(|(_, name)| name.as_deref() == Some(requested))
+                .map(|(seat, _)| seat.clone())
+                .ok_or_else(|| {
+                    let available = self
+                        .seats
+                        .iter()
+                        .map(|(_, name)| name.as_deref().unwrap_or("<unnamed>"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "Wayland seat {requested:?} not found; available seats: {available}"
+                    )
+                })?,
+            None => match self.seats.as_slice() {
+                [(seat, _)] => seat.clone(),
+                [] => return Err("missing Wayland protocol: wl_seat".to_string()),
+                seats => {
+                    let available = seats
+                        .iter()
+                        .map(|(_, name)| name.as_deref().unwrap_or("<unnamed>"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "multiple Wayland seats advertised ({available}); select one with --seat-name"
+                    ));
+                }
+            },
+        };
+
+        self.seat = Some(selected);
+        Ok(())
     }
 
     /// Returns `Err` listing any missing protocols, or `Ok(())` if all are bound.
@@ -116,7 +156,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                 "wl_seat" => {
                     let seat =
                         registry.bind::<wl_seat::WlSeat, _, Self>(name, version.min(9), qh, ());
-                    state.wl.seat = Some(seat);
+                    state.wl.seats.push((seat, None));
                 }
                 "zwlr_virtual_pointer_manager_v1" => {
                     let mgr = registry.bind::<ZwlrVirtualPointerManagerV1, _, Self>(
@@ -142,11 +182,31 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
     }
 }
 
+impl Dispatch<wl_seat::WlSeat, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Name { name } = event
+            && let Some((_, seat_name)) = state
+                .wl
+                .seats
+                .iter_mut()
+                .find(|(candidate, _)| candidate.id() == seat.id())
+        {
+            *seat_name = Some(name);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // No-op dispatchers for interfaces we bind but never handle events from.
 // ---------------------------------------------------------------------------
 
-delegate_noop!(AppState: ignore wl_seat::WlSeat);
 delegate_noop!(AppState: ignore ZwlrVirtualPointerManagerV1);
 delegate_noop!(AppState: ignore ZwlrVirtualPointerV1);
 delegate_noop!(AppState: ignore ZwpVirtualKeyboardManagerV1);
@@ -163,6 +223,7 @@ delegate_noop!(AppState: ignore ZwpVirtualKeyboardV1);
 /// Returns the connection, event queue, and fully-initialised AppState.
 pub fn connect(
     display: Option<&str>,
+    seat_name: Option<&str>,
 ) -> Result<(Connection, EventQueue<AppState>, AppState), Box<dyn std::error::Error>> {
     if let Some(name) = display {
         // SAFETY: called before any threads are spawned (single-threaded init).
@@ -185,8 +246,15 @@ pub fn connect(
         keymap_str: String::new(), // set by caller after connect
     };
 
-    // Roundtrip to receive all global advertisements.
+    // The first roundtrip receives globals. A second one receives wl_seat.name
+    // events from the seat objects bound while handling those globals.
     event_queue.roundtrip(&mut state)?;
+    event_queue.roundtrip(&mut state)?;
+
+    state
+        .wl
+        .select_seat(seat_name)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Verify all required protocols were advertised.
     state

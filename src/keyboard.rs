@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 
 use rustix::fs::{MemfdFlags, memfd_create};
-use tracing::{debug, info};
+use tracing::info;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use xkbcommon::xkb;
 
@@ -98,12 +98,6 @@ impl KeyboardState {
             let group = self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
 
             vkbd.modifiers(mods_depressed, mods_latched, mods_locked, group);
-            debug!(
-                mods_depressed,
-                mods_latched, mods_locked, group, "sent modifier state update"
-            );
         }
-
-        debug!(time_ms, scancode, pressed, "forwarded key event");
     }
 }

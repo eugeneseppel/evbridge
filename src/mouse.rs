@@ -1,4 +1,3 @@
-use tracing::debug;
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
@@ -80,25 +79,21 @@ impl MouseFrame {
 
         // 1. Relative motion
         if self.dx != 0.0 || self.dy != 0.0 {
-            debug!(dx = self.dx, dy = self.dy, "mouse: relative motion");
             vptr.motion(time_ms, self.dx, self.dy);
         }
 
         // 2. Absolute motion
         if let (Some((x, y)), Some((ext_w, ext_h))) = (self.abs, extent) {
-            debug!(x, y, ext_w, ext_h, "mouse: absolute motion");
             vptr.motion_absolute(time_ms, x, y, ext_w, ext_h);
         }
 
         // 3. Vertical scroll
         if self.scroll_vert != 0.0 {
-            debug!(value = self.scroll_vert, "mouse: vertical scroll");
             vptr.axis(time_ms, Axis::VerticalScroll, self.scroll_vert);
         }
 
         // 4. Horizontal scroll
         if self.scroll_horiz != 0.0 {
-            debug!(value = self.scroll_horiz, "mouse: horizontal scroll");
             vptr.axis(time_ms, Axis::HorizontalScroll, self.scroll_horiz);
         }
 
@@ -109,7 +104,6 @@ impl MouseFrame {
             } else {
                 ButtonState::Released
             };
-            debug!(code, ?state, "mouse: button");
             vptr.button(time_ms, code, state);
         }
 

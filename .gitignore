@@ -1,1 +1,12 @@
+# Rust build output
 /target/
+
+# Docker-exported binaries
+/dist/
+/dist-*/
+
+# IDE metadata
+/.idea/
+
+# Machine-local build and deployment helper
+/sc.sh

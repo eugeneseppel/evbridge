@@ -121,10 +121,9 @@ impl Watcher {
             .flatten()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("event"))
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("event") && self.passes_phys_filter(name)
+                })
             })
             .map(|entry| entry.path())
             .collect();

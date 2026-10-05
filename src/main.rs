@@ -31,6 +31,20 @@ use crate::wayland::AppState;
 struct Cli {
     #[arg(long)]
     wayland_display: Option<String>,
+    /// Name of the target wl_seat. Required when the compositor advertises more than one seat.
+    #[arg(long)]
+    seat_name: Option<String>,
+    /// Bridge an existing evdev device using automatic capability classification.
+    /// May be specified more than once.
+    #[arg(long)]
+    device: Vec<PathBuf>,
+    /// Bridge only pointer events from an existing evdev device, ignoring any
+    /// keyboard-like capabilities it also advertises. May be specified more than once.
+    #[arg(long)]
+    mouse_device: Vec<PathBuf>,
+    /// Exclusively grab bridged evdev devices so other host applications do not receive events.
+    #[arg(long, default_value_t = false)]
+    grab: bool,
     #[arg(long, default_value = "/dev/input")]
     input_dir: PathBuf,
     #[arg(long, default_value = "us")]
@@ -45,6 +59,10 @@ struct Cli {
     /// Only devices whose /sys/class/input/eventN/device/phys contains this string are accepted.
     #[arg(long, env = "EVBRIDGE_PHYS_FILTER")]
     phys_filter: Option<String>,
+    /// Create missing /dev/input nodes for newly appearing sysfs devices.
+    /// This needs CAP_MKNOD and is disabled by default.
+    #[arg(long, default_value_t = false)]
+    create_missing_device_nodes: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +73,12 @@ struct Cli {
 /// source registration. remove_device() must remove the calloop source BEFORE
 /// dropping the evdev::Device that owns the fd.
 struct FdWrapper(RawFd);
+
+#[derive(Clone, Copy)]
+enum DeviceRole {
+    Auto,
+    PointerOnly,
+}
 
 impl AsFd for FdWrapper {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -70,15 +94,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
-        )
+        // Do not read RUST_LOG: service-manager or inherited environment must not
+        // be able to override the explicitly requested logging policy.
+        .with_env_filter(EnvFilter::new(&cli.log_level))
         .init();
 
     info!("evbridge starting");
 
     // 1. Connect to Wayland
-    let (conn, event_queue, mut state) = wayland::connect(cli.wayland_display.as_deref())?;
+    let (conn, event_queue, mut state) = wayland::connect(
+        cli.wayland_display.as_deref(),
+        cli.seat_name.as_deref(),
+    )?;
     info!("connected to Wayland compositor");
 
     // 2. Generate XKB keymap
@@ -96,65 +123,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         queue.dispatch_pending(state)
     })?;
 
-    // 5. Create watcher (snapshots sysfs baseline), scan existing devices
-    let watcher = Watcher::new(&cli.input_dir, cli.phys_filter.as_deref())?;
-    let existing = watcher.scan_existing();
-    for path in &existing {
-        if let Err(e) = add_device(path, &mut state, &loop_handle) {
-            warn!(?path, err = %e, "failed to add existing device");
+    if !cli.device.is_empty() || !cli.mouse_device.is_empty() {
+        for device in &cli.device {
+            add_device(
+                device,
+                &mut state,
+                &loop_handle,
+                cli.grab,
+                DeviceRole::Auto,
+            )?;
         }
-    }
+        for device in &cli.mouse_device {
+            add_device(
+                device,
+                &mut state,
+                &loop_handle,
+                cli.grab,
+                DeviceRole::PointerOnly,
+            )?;
+        }
+        info!(
+            device_count = cli.device.len() + cli.mouse_device.len(),
+            "exact-device mode active; directory watching and mknod disabled"
+        );
+    } else {
+        // Create watcher (snapshots sysfs baseline), scan existing devices.
+        let watcher = Watcher::new(&cli.input_dir, cli.phys_filter.as_deref())?;
+        let existing = watcher.scan_existing();
+        for path in &existing {
+            if let Err(e) = add_device(
+                path,
+                &mut state,
+                &loop_handle,
+                cli.grab,
+                DeviceRole::Auto,
+            ) {
+                warn!(?path, err = %e, "failed to add existing device");
+            }
+        }
 
-    // 6. Insert inotify watcher as calloop source
-    //    We extract the raw fd and keep the Watcher in a shared cell so the
-    //    callback can call read_events().
-    let watcher_fd = watcher.as_fd().as_raw_fd();
-    let watcher_cell = std::rc::Rc::new(std::cell::RefCell::new(watcher));
+        // Insert inotify watcher as calloop source.
+        let watcher_fd = watcher.as_fd().as_raw_fd();
+        let watcher_cell = std::rc::Rc::new(std::cell::RefCell::new(watcher));
 
-    let watcher_for_cb = watcher_cell.clone();
-    let loop_handle_for_cb = loop_handle.clone();
+        let watcher_for_cb = watcher_cell.clone();
+        let loop_handle_for_cb = loop_handle.clone();
+        let grab_for_cb = cli.grab;
 
-    loop_handle.insert_source(
-        Generic::new(FdWrapper(watcher_fd), Interest::READ, Mode::Level),
-        move |_, _, state| {
-            let mut w = watcher_for_cb.borrow_mut();
-            let events = match w.read_events() {
-                Ok(events) => events,
-                Err(e) => {
-                    error!(err = %e, "failed to read inotify events");
-                    return Ok(PostAction::Continue);
-                }
-            };
-            for event in events {
-                match event {
-                    WatchEvent::DeviceAdded(path) => {
-                        if let Err(e) = add_device(&path, state, &loop_handle_for_cb) {
-                            warn!(?path, err = %e, "failed to add device");
+        loop_handle.insert_source(
+            Generic::new(FdWrapper(watcher_fd), Interest::READ, Mode::Level),
+            move |_, _, state| {
+                let mut w = watcher_for_cb.borrow_mut();
+                let events = match w.read_events() {
+                    Ok(events) => events,
+                    Err(e) => {
+                        error!(err = %e, "failed to read inotify events");
+                        return Ok(PostAction::Continue);
+                    }
+                };
+                for event in events {
+                    match event {
+                        WatchEvent::DeviceAdded(path) => {
+                            if let Err(e) =
+                                add_device(
+                                    &path,
+                                    state,
+                                    &loop_handle_for_cb,
+                                    grab_for_cb,
+                                    DeviceRole::Auto,
+                                )
+                            {
+                                warn!(?path, err = %e, "failed to add device");
+                            }
+                        }
+                        WatchEvent::DeviceRemoved(path) => {
+                            remove_device(&path, state, &loop_handle_for_cb);
                         }
                     }
-                    WatchEvent::DeviceRemoved(path) => {
-                        remove_device(&path, state, &loop_handle_for_cb);
-                    }
                 }
-            }
-            Ok(PostAction::Continue)
-        },
-    )?;
+                Ok(PostAction::Continue)
+            },
+        )?;
 
-    // 7. Periodic scan for missing device nodes (mknod).
-    //    uinput devices created by Sunshine appear in /sys/class/input/ but
-    //    their /dev/input/eventN nodes may not exist in a bind-mounted /dev/input.
-    //    We scan every 500ms and create any missing nodes; inotify then fires
-    //    the normal DeviceAdded path.
-    let watcher_for_timer = watcher_cell.clone();
-    loop_handle.insert_source(
-        calloop::timer::Timer::from_duration(std::time::Duration::from_millis(500)),
-        move |_, _, _state| {
-            let w = watcher_for_timer.borrow();
-            w.ensure_device_nodes();
-            calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_millis(500))
-        },
-    )?;
+        // Device-node creation is privileged and opt-in. It is only useful when
+        // uinput devices appear in sysfs but not in a bind-mounted /dev/input.
+        if cli.create_missing_device_nodes {
+            let watcher_for_timer = watcher_cell.clone();
+            loop_handle.insert_source(
+                calloop::timer::Timer::from_duration(std::time::Duration::from_millis(500)),
+                move |_, _, _state| {
+                    let w = watcher_for_timer.borrow();
+                    w.ensure_device_nodes();
+                    calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_millis(500))
+                },
+            )?;
+        }
+    }
 
     // 8. SIGINT/SIGTERM handling
     let running = Arc::new(AtomicBool::new(true));
@@ -217,13 +281,15 @@ fn add_device(
     path: &Path,
     state: &mut AppState,
     loop_handle: &calloop::LoopHandle<'static, AppState>,
+    grab: bool,
+    role: DeviceRole,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if state.devices.contains_key(path) {
         debug!(?path, "device already tracked, skipping");
         return Ok(());
     }
 
-    let dev = evdev::Device::open(path)?;
+    let mut dev = evdev::Device::open(path)?;
     dev.set_nonblocking(true)?;
 
     let caps = DeviceCaps::from_device(&dev);
@@ -234,7 +300,7 @@ fn add_device(
         return Ok(());
     }
 
-    if types.contains(&DeviceType::Gamepad) {
+    if matches!(role, DeviceRole::Auto) && types.contains(&DeviceType::Gamepad) {
         info!(
             ?path,
             "gamepad detected, creating udev db entry for SDL/Steam"
@@ -245,9 +311,31 @@ fn add_device(
         return Ok(());
     }
 
-    let has_mouse =
+    if grab {
+        dev.grab().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to exclusively grab {}: {e}", path.display()),
+            )
+        })?;
+        info!(?path, "exclusively grabbed input device");
+    }
+
+    let supports_mouse =
         types.contains(&DeviceType::Mouse) || types.contains(&DeviceType::AbsoluteMouse);
-    let has_keyboard = types.contains(&DeviceType::Keyboard);
+    let supports_keyboard = types.contains(&DeviceType::Keyboard);
+
+    let (has_mouse, has_keyboard) = match role {
+        DeviceRole::Auto => (supports_mouse, supports_keyboard),
+        DeviceRole::PointerOnly if supports_mouse => (true, false),
+        DeviceRole::PointerOnly => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} does not advertise pointer capabilities", path.display()),
+            )
+            .into());
+        }
+    };
 
     let pointer = if has_mouse {
         let vptr = state.wl.create_virtual_pointer(&state.qh);

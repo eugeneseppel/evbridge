@@ -1,0 +1,47 @@
+[Unit]
+Description=Bridge player2 keyboard and mouse to nested Sway
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+User=user
+Group=user
+SupplementaryGroups=input
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStartPre=/usr/bin/test -S /run/user/1000/wayland-1
+ExecStart=/usr/local/libexec/evbridge --wayland-display wayland-1 --device /dev/input/by-id/usb-099a_USB_Keyboard-event-kbd --mouse-device /dev/input/by-id/usb-Logitech_USB_Receiver-if02-event-mouse --grab --seat-name player2 --log-level info
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+DevicePolicy=closed
+DeviceAllow=/dev/input/by-id/usb-099a_USB_Keyboard-event-kbd r
+DeviceAllow=/dev/input/by-id/usb-Logitech_USB_Receiver-if02-event-mouse r
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=/run/user/1000/wayland-1
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

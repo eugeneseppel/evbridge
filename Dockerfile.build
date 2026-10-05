@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+FROM rust:bookworm AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libwayland-dev \
+        libxkbcommon-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10000 builder
+
+WORKDIR /src
+RUN chown builder:builder /src
+USER builder
+
+COPY --chown=builder:builder Cargo.toml Cargo.lock ./
+COPY --chown=builder:builder src ./src
+RUN cargo build --locked --release
+
+FROM scratch AS export
+COPY --from=build /src/target/release/evbridge /
