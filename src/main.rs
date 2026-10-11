@@ -106,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.wayland_display.as_deref(),
         cli.seat_name.as_deref(),
     )?;
+    let shutdown_conn = conn.clone();
     info!("connected to Wayland compositor");
 
     // 2. Generate XKB keymap
@@ -233,17 +234,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_loop.dispatch(std::time::Duration::from_millis(100), &mut state)?;
     }
 
-    // Graceful shutdown: destroy all virtual devices
+    // Graceful shutdown: release held buttons before destroying virtual devices.
     info!("evbridge shutting down");
     for (path, tracked) in state.devices.drain() {
-        if let Some(vptr) = tracked.pointer {
-            vptr.destroy();
-        }
-        if let Some(vkbd) = tracked.keyboard {
-            vkbd.destroy();
-        }
+        destroy_tracked_device(tracked);
         info!(?path, "destroyed virtual device");
     }
+    shutdown_conn.flush()?;
     Ok(())
 }
 
@@ -393,12 +390,7 @@ fn add_device(
             if should_remove {
                 // Remove dead device and destroy virtual objects
                 if let Some(tracked) = state.devices.remove(&path_for_cb) {
-                    if let Some(vptr) = tracked.pointer {
-                        vptr.destroy();
-                    }
-                    if let Some(vkbd) = tracked.keyboard {
-                        vkbd.destroy();
-                    }
+                    destroy_tracked_device(tracked);
                     info!(path = ?path_for_cb, "removed dead device (ENODEV)");
                 }
                 return Ok(PostAction::Remove);
@@ -437,18 +429,37 @@ fn remove_device(
 ) {
     if let Some(tracked) = state.devices.remove(path) {
         loop_handle.remove(tracked.token);
-        if let Some(vptr) = tracked.pointer {
-            vptr.destroy();
-        }
-        if let Some(vkbd) = tracked.keyboard {
-            vkbd.destroy();
-        }
+        destroy_tracked_device(tracked);
         info!(?path, "device removed");
     } else {
         // Might be a gamepad (not tracked in state.devices) — clean up udev entry
         cleanup_udev_entry(path);
         debug!(?path, "remove_device called for unknown device");
     }
+}
+
+fn destroy_tracked_device(mut tracked: wayland::TrackedDevice) {
+    let time_ms = current_time_ms();
+    if let Some(ref vptr) = tracked.pointer {
+        tracked.frame.flush(vptr, time_ms, tracked.extent);
+        tracked.frame.release_all(vptr, time_ms);
+    }
+    if let (Some(vkbd), Some(kbd_state)) = (&tracked.keyboard, &mut tracked.kbd_state) {
+        kbd_state.release_all(vkbd, time_ms);
+    }
+    if let Some(vptr) = tracked.pointer {
+        vptr.destroy();
+    }
+    if let Some(vkbd) = tracked.keyboard {
+        vkbd.destroy();
+    }
+}
+
+fn current_time_ms() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u32)
+        .unwrap_or(0)
 }
 
 fn cleanup_udev_entry(path: &Path) {
@@ -522,15 +533,13 @@ fn process_events(tracked: &mut wayland::TrackedDevice) -> bool {
             EventType::KEY => {
                 let code = ev.code();
                 let value = ev.value();
-                let pressed = value != 0;
-
                 // BTN range 0x110..=0x11f = mouse buttons
                 if (0x110..=0x11f).contains(&code) {
                     if tracked.pointer.is_some() {
-                        tracked.frame.accumulate_button(code as u32, pressed);
+                        tracked.frame.accumulate_button(code as u32, value);
                     }
                 } else if let (Some(vkbd), Some(ks)) = (&tracked.keyboard, &mut tracked.kbd_state) {
-                    ks.forward_key(vkbd, time_ms, code as u32, pressed);
+                    ks.forward_key(vkbd, time_ms, code as u32, value);
                 }
             }
             EventType::SYNCHRONIZATION => {

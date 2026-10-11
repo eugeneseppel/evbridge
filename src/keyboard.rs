@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::os::fd::AsFd;
 
@@ -52,6 +53,7 @@ pub fn send_keymap(vkbd: &ZwpVirtualKeyboardV1, keymap_str: &str) -> io::Result<
 /// Tracks modifier state and sends modifiers() to the compositor when it changes.
 pub struct KeyboardState {
     state: xkb::State,
+    pressed_keys: BTreeSet<u32>,
 }
 
 impl KeyboardState {
@@ -66,7 +68,10 @@ impl KeyboardState {
         .expect("failed to compile XKB keymap for state tracking");
 
         let state = xkb::State::new(&keymap);
-        Self { state }
+        Self {
+            state,
+            pressed_keys: BTreeSet::new(),
+        }
     }
 
     /// Process a key event and send modifiers to compositor if state changed.
@@ -76,8 +81,12 @@ impl KeyboardState {
         vkbd: &ZwpVirtualKeyboardV1,
         time_ms: u32,
         scancode: u32,
-        pressed: bool,
+        value: i32,
     ) {
+        let Some(pressed) = update_pressed_keys(&mut self.pressed_keys, scancode, value) else {
+            return;
+        };
+
         let wayland_state: u32 = if pressed { 1 } else { 0 };
         vkbd.key(time_ms, scancode, wayland_state);
 
@@ -92,12 +101,82 @@ impl KeyboardState {
         let changed = self.state.update_key(xkb_keycode.into(), direction);
 
         if changed != 0 {
-            let mods_depressed = self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
-            let mods_latched = self.state.serialize_mods(xkb::STATE_MODS_LATCHED);
-            let mods_locked = self.state.serialize_mods(xkb::STATE_MODS_LOCKED);
-            let group = self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
-
-            vkbd.modifiers(mods_depressed, mods_latched, mods_locked, group);
+            self.send_modifiers(vkbd);
         }
+    }
+
+    /// Release every key still logically held by this virtual keyboard.
+    pub fn release_all(&mut self, vkbd: &ZwpVirtualKeyboardV1, time_ms: u32) {
+        let pressed_keys = std::mem::take(&mut self.pressed_keys);
+        if pressed_keys.is_empty() {
+            return;
+        }
+
+        for scancode in pressed_keys {
+            vkbd.key(time_ms, scancode, 0);
+            self.state
+                .update_key((scancode + 8).into(), xkb::KeyDirection::Up);
+        }
+        self.send_modifiers(vkbd);
+    }
+
+    fn send_modifiers(&self, vkbd: &ZwpVirtualKeyboardV1) {
+        let mods_depressed = self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+        let mods_latched = self.state.serialize_mods(xkb::STATE_MODS_LATCHED);
+        let mods_locked = self.state.serialize_mods(xkb::STATE_MODS_LOCKED);
+        let group = self.state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+
+        vkbd.modifiers(mods_depressed, mods_latched, mods_locked, group);
+    }
+}
+
+fn update_pressed_keys(
+    pressed_keys: &mut BTreeSet<u32>,
+    scancode: u32,
+    value: i32,
+) -> Option<bool> {
+    // EV_KEY uses 0 for release, 1 for press, and 2 for repeat. The compositor
+    // owns key repeat for a virtual keyboard, so only forward real transitions.
+    let pressed = match value {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let changed = if pressed {
+        pressed_keys.insert(scancode)
+    } else {
+        pressed_keys.remove(&scancode)
+    };
+    changed.then_some(pressed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::update_pressed_keys;
+
+    const KEY_A: u32 = 30;
+
+    #[test]
+    fn key_repeat_does_not_create_a_second_press() {
+        let mut pressed_keys = BTreeSet::new();
+
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 1), Some(true));
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 2), None);
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 0), Some(false));
+        assert!(pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn duplicate_key_transitions_are_discarded() {
+        let mut pressed_keys = BTreeSet::new();
+
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 0), None);
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 1), Some(true));
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 1), None);
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 0), Some(false));
+        assert_eq!(update_pressed_keys(&mut pressed_keys, KEY_A, 0), None);
+        assert!(pressed_keys.is_empty());
     }
 }

@@ -30,3 +30,6 @@
 
 8. [ ] Add support for high-resolution wheel events and additional mouse buttons.
 9. [ ] Review keyboard repeat and layout behavior in the nested Sway session.
+10. [ ] Investigate why the player2 cursor occasionally becomes visible and moves
+    over the game surface. Check the game's pointer constraint and cursor-hiding
+    behavior separately from evbridge motion forwarding.

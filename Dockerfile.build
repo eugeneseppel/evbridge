@@ -15,7 +15,8 @@ USER builder
 
 COPY --chown=builder:builder Cargo.toml Cargo.lock ./
 COPY --chown=builder:builder src ./src
-RUN cargo build --locked --release
+RUN cargo test --locked \
+    && cargo build --locked --release
 
 FROM scratch AS export
 COPY --from=build /src/target/release/evbridge /

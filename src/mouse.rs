@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
@@ -8,6 +10,7 @@ pub struct MouseFrame {
     dx: f64,
     dy: f64,
     buttons: Vec<(u32, bool)>,
+    pressed_buttons: BTreeSet<u32>,
     scroll_vert: f64,
     scroll_horiz: f64,
     abs: Option<(u32, u32)>,
@@ -26,6 +29,7 @@ impl MouseFrame {
             dx: 0.0,
             dy: 0.0,
             buttons: Vec::new(),
+            pressed_buttons: BTreeSet::new(),
             scroll_vert: 0.0,
             scroll_horiz: 0.0,
             abs: None,
@@ -43,9 +47,40 @@ impl MouseFrame {
         self.has_data = true;
     }
 
-    pub fn accumulate_button(&mut self, code: u32, pressed: bool) {
+    pub fn accumulate_button(&mut self, code: u32, value: i32) {
+        // EV_KEY uses 0 for release, 1 for press, and 2 for repeat. Pointer
+        // repeats must not become duplicate presses: wlroots tracks presses as
+        // a count, so one physical release would otherwise leave the button
+        // logically held. Also discard duplicate transitions defensively.
+        let pressed = match value {
+            0 => false,
+            1 => true,
+            _ => return,
+        };
+        let changed = if pressed {
+            self.pressed_buttons.insert(code)
+        } else {
+            self.pressed_buttons.remove(&code)
+        };
+        if !changed {
+            return;
+        }
+
         self.buttons.push((code, pressed));
         self.has_data = true;
+    }
+
+    /// Release every button still logically held by this virtual pointer.
+    /// Call `flush` first so pending physical transitions are emitted in order.
+    pub fn release_all(&mut self, vptr: &ZwlrVirtualPointerV1, time_ms: u32) {
+        if self.pressed_buttons.is_empty() {
+            return;
+        }
+
+        for code in std::mem::take(&mut self.pressed_buttons) {
+            vptr.button(time_ms, code, ButtonState::Released);
+        }
+        vptr.frame();
     }
 
     pub fn accumulate_scroll_vert(&mut self, value: i32) {
@@ -118,5 +153,38 @@ impl MouseFrame {
         self.scroll_horiz = 0.0;
         self.abs = None;
         self.has_data = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MouseFrame;
+
+    const BTN_LEFT: u32 = 0x110;
+
+    #[test]
+    fn pointer_repeat_does_not_create_a_second_press() {
+        let mut frame = MouseFrame::new();
+
+        frame.accumulate_button(BTN_LEFT, 1);
+        frame.accumulate_button(BTN_LEFT, 2);
+        frame.accumulate_button(BTN_LEFT, 0);
+
+        assert_eq!(frame.buttons, vec![(BTN_LEFT, true), (BTN_LEFT, false)]);
+        assert!(frame.pressed_buttons.is_empty());
+    }
+
+    #[test]
+    fn duplicate_transitions_are_discarded() {
+        let mut frame = MouseFrame::new();
+
+        frame.accumulate_button(BTN_LEFT, 0);
+        frame.accumulate_button(BTN_LEFT, 1);
+        frame.accumulate_button(BTN_LEFT, 1);
+        frame.accumulate_button(BTN_LEFT, 0);
+        frame.accumulate_button(BTN_LEFT, 0);
+
+        assert_eq!(frame.buttons, vec![(BTN_LEFT, true), (BTN_LEFT, false)]);
+        assert!(frame.pressed_buttons.is_empty());
     }
 }
